@@ -65,8 +65,8 @@ my %cli_options = ();
 my $jobname;
 my $jobstart;
 my $jobend;
-
 my $array_job = 0;
+my $sge_job_id;
 
 sub print_usage() {
   print STDERR
@@ -88,6 +88,14 @@ sub print_usage() {
    "  --max-jobs-run <num-jobs>\n" .
    "  --gpu <0|1> (default: $gpu)\n";
   exit 1;
+}
+
+sub caught_signal {
+  if ( defined $sge_job_id ) { # Signal trapped after submitting jobs
+    my $signal = $!;
+    system ("qdel $sge_job_id");
+    die "Caught a signal: $signal , deleting SGE task: $sge_job_id and exiting\n";
+  }
 }
 
 if (@ARGV < 2) {
@@ -178,6 +186,9 @@ EOF
 # passed to queue system would be "-l ram_free=2G,mem_free=2G
 # A more detailed description of the ways the options would be handled is at
 # the top of this file.
+
+$SIG{INT} = \&caught_signal;
+$SIG{TERM} = \&caught_signal;
 
 my $opened_config_file = 1;
 
@@ -312,8 +323,10 @@ if (!-d $dir) { die "Cannot make the directory $dir\n"; }
 # make a directory called "q",
 # where we will put the log created by qsub... normally this doesn't contain
 # anything interesting, evertyhing goes to $logfile.
-if (! -d "$qdir") {
-  system "mkdir $qdir 2>/dev/null";
+# in $qdir/sync we'll put the done.* files... we try to keep this
+# directory small because it's transmitted over NFS many times.
+if (! -d "$qdir/sync") {
+  system "mkdir -p $qdir/sync 2>/dev/null";
   sleep(5); ## This is to fix an issue we encountered in denominator lattice creation,
   ## where if e.g. the exp/tri2b_denlats/log/15/q directory had just been
   ## created and the job immediately ran, it would die with an error because nfs
@@ -345,9 +358,9 @@ if ($queue_scriptfile !~ m:^/:) {
 # Also keep our current PATH around, just in case there was something
 # in it that we need (although we also source ./path.sh)
 
-my $syncfile = "$qdir/done.$$";
+my $syncfile = "$qdir/sync/done.$$";
 
-system("rm $queue_logfile $syncfile 2>/dev/null");
+unlink($queue_logfile, $syncfile);
 #
 # Write to the script file, and then close it.
 #
@@ -398,7 +411,7 @@ for (my $try = 1; $try < 5; $try++) {
       print STDERR "queue log file is $queue_logfile, command was $qsub_cmd\n";
       my $err = `tail $queue_logfile`;
       print STDERR "Output of qsub was: $err\n";
-      if ($err =~ m/gdi request/) {
+      if ($err =~ m/gdi request/ || $err =~ m/qmaster/) {
         # When we get queue connectivity problems we usually see a message like:
         # Unable to run job: failed receiving gdi request response for mid=1 (got
         # syncron message receive timeout error)..
@@ -416,7 +429,6 @@ for (my $try = 1; $try < 5; $try++) {
   }
 }
 
-my $sge_job_id;
 if (! $sync) { # We're not submitting with -sync y, so we
   # need to wait for the jobs to finish.  We wait for the
   # sync-files we "touched" in the script to exist.
@@ -461,9 +473,9 @@ if (! $sync) { # We're not submitting with -sync y, so we
         # the following (.kick) commands are basically workarounds for NFS bugs.
         if (rand() < 0.25) { # don't do this every time...
           if (rand() > 0.5) {
-            system("touch $qdir/.kick");
+            system("touch $qdir/sync/.kick");
           } else {
-            system("rm $qdir/.kick 2>/dev/null");
+            unlink("$qdir/sync/.kick");
           }
         }
         if ($counter++ % 10 == 0) {
@@ -472,7 +484,7 @@ if (! $sync) { # We're not submitting with -sync y, so we
           # updated, even though the file exists on the server.
           # Only do this every 10 waits (every 30 seconds) though, or if there
           # are many jobs waiting they can overwhelm the file server.
-          system("ls $qdir >/dev/null");
+          system("ls $qdir/sync >/dev/null");
         }
       }
 
@@ -489,7 +501,7 @@ if (! $sync) { # We're not submitting with -sync y, so we
         if ( -f $f ) { next; }  #syncfile appeared: OK.
         my $output = `qstat -j $sge_job_id 2>&1`;
         my $ret = $?;
-        if ($ret >> 8 == 1 && $output !~ m/contact qmaster/ &&
+        if ($ret >> 8 == 1 && $output !~ m/qmaster/ &&
             $output !~ m/gdi request/) {
           # Don't consider immediately missing job as error, first wait some
           # time to make sure it is not just delayed creation of the syncfile.
@@ -498,18 +510,18 @@ if (! $sync) { # We're not submitting with -sync y, so we
           # Sometimes NFS gets confused and thinks it's transmitted the directory
           # but it hasn't, due to timestamp issues.  Changing something in the
           # directory will usually fix that.
-          system("touch $qdir/.kick");
-          system("rm $qdir/.kick 2>/dev/null");
+          system("touch $qdir/sync/.kick");
+          unlink("$qdir/sync/.kick");
           if ( -f $f ) { next; }   #syncfile appeared, ok
           sleep(7);
-          system("touch $qdir/.kick");
+          system("touch $qdir/sync/.kick");
           sleep(1);
-          system("rm $qdir/.kick 2>/dev/null");
+          unlink("qdir/sync/.kick");
           if ( -f $f ) {  next; }   #syncfile appeared, ok
           sleep(60);
-          system("touch $qdir/.kick");
+          system("touch $qdir/sync/.kick");
           sleep(1);
-          system("rm $qdir/.kick 2>/dev/null");
+          unlink("$qdir/sync/.kick");
           if ( -f $f ) { next; }  #syncfile appeared, ok
           $f =~ m/\.(\d+)$/ || die "Bad sync-file name $f";
           my $job_id = $1;
@@ -533,7 +545,8 @@ if (! $sync) { # We're not submitting with -sync y, so we
               "longer exists, log is in $logfile, last line is '$last_line', " .
               "syncfile is $f, return status of qstat was $ret\n" .
               "Possible reasons: a) Exceeded time limit? -> Use more jobs!" .
-              " b) Shutdown/Frozen machine? -> Run again!\n";
+              " b) Shutdown/Frozen machine? -> Run again!  Qmaster output " .
+              "was: $output\n";
             exit(1);
           }
         } elsif ($ret != 0) {
@@ -543,8 +556,7 @@ if (! $sync) { # We're not submitting with -sync y, so we
       }
     }
   }
-  my $all_syncfiles = join(" ", @syncfiles);
-  system("rm $all_syncfiles 2>/dev/null");
+  unlink(@syncfiles);
 }
 
 # OK, at this point we are synced; we know the job is done.
